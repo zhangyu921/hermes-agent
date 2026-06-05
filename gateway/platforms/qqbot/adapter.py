@@ -631,10 +631,17 @@ class QQAdapter(BasePlatformAdapter):
                     quick_disconnect_count = 0
                 else:
                     backoff_idx += 1
-                    if backoff_idx >= MAX_RECONNECT_ATTEMPTS:
-                        logger.error("[%s] Max reconnect attempts reached (QQCloseError)", self._log_tag)
-                        self._mark_disconnected()
-                        return
+                    # Reconnect failures here are usually transient (network
+                    # down during token refresh / gateway URL fetch).  Keep
+                    # retrying indefinitely with capped backoff — the
+                    # protocol-level close code was already handled above.
+                    if backoff_idx > 0 and backoff_idx % 10 == 0:
+                        logger.warning(
+                            "[%s] Still trying to reconnect after close "
+                            "(attempt %d)...",
+                            self._log_tag,
+                            backoff_idx + 1,
+                        )
 
             except Exception as exc:
                 if not self._running:
@@ -643,10 +650,16 @@ class QQAdapter(BasePlatformAdapter):
                 self._mark_transport_disconnected()
                 self._fail_pending("Connection interrupted")
 
-                if backoff_idx >= MAX_RECONNECT_ATTEMPTS:
-                    logger.error("[%s] Max reconnect attempts reached", self._log_tag)
-                    self._mark_disconnected()
-                    return
+                # Network/token errors are transient (e.g. laptop sleep/wake,
+                # proxy restart). Never give up — keep retrying with capped
+                # backoff (max 60s).  QQCloseError handler still enforces
+                # MAX_RECONNECT_ATTEMPTS for protocol-level fatal loops.
+                if backoff_idx > 0 and backoff_idx % 10 == 0:
+                    logger.warning(
+                        "[%s] Still trying to reconnect (attempt %d)...",
+                        self._log_tag,
+                        backoff_idx + 1,
+                    )
 
                 if await self._reconnect(backoff_idx):
                     backoff_idx = 0
