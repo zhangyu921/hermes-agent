@@ -40,6 +40,10 @@ CONNECT_TIMEOUT_SECONDS = 20.0
 
 RECONNECT_BACKOFF = [2, 5, 10, 30, 60]
 MAX_RECONNECT_ATTEMPTS = 100
+# Hard deadline for a single reconnect handshake (token → gateway URL →
+# WebSocket open).  Prevents a wedged network stack after macOS sleep/wake
+# from blocking the reconnect loop for 30+ minutes.
+RECONNECT_HANDSHAKE_TIMEOUT = 45.0
 RATE_LIMIT_DELAY = 60  # seconds
 QUICK_DISCONNECT_THRESHOLD = 5.0  # seconds
 MAX_QUICK_DISCONNECT_COUNT = 3

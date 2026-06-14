@@ -100,6 +100,7 @@ from gateway.platforms.qqbot.constants import (
     CONNECT_TIMEOUT_SECONDS,
     RECONNECT_BACKOFF,
     MAX_RECONNECT_ATTEMPTS,
+    RECONNECT_HANDSHAKE_TIMEOUT,
     RATE_LIMIT_DELAY,
     QUICK_DISCONNECT_THRESHOLD,
     MAX_QUICK_DISCONNECT_COUNT,
@@ -668,7 +669,14 @@ class QQAdapter(BasePlatformAdapter):
                     backoff_idx += 1
 
     async def _reconnect(self, backoff_idx: int) -> bool:
-        """Attempt to reconnect the WebSocket. Returns True on success."""
+        """Attempt to reconnect the WebSocket. Returns True on success.
+
+        Recreates the httpx client on every attempt so that stale TCP
+        connections from sleep/wake or proxy restarts are dropped.
+        The whole operation is guarded by a hard timeout so a wedged
+        network stack (common after macOS lid-close sleep) cannot
+        stall the reconnect loop indefinitely.
+        """
         delay = RECONNECT_BACKOFF[min(backoff_idx, len(RECONNECT_BACKOFF) - 1)]
         logger.info(
             "[%s] Reconnecting in %ds (attempt %d)...",
@@ -678,17 +686,69 @@ class QQAdapter(BasePlatformAdapter):
         )
         await asyncio.sleep(delay)
 
+        # Drop the old WebSocket reference so that if this reconnect
+        # attempt fails, _read_events() will raise RuntimeError and
+        # the _listen_loop exception handler will call _reconnect again
+        # (instead of silently spinning with backoff_idx=0).
+        if self._ws:
+            try:
+                await self._ws.close()
+            except Exception:
+                pass
+        self._ws = None
+
+        # Refresh the HTTP client so we don't reuse stale connections
+        # left over from a sleep/wake cycle or proxy restart.
+        await self._refresh_http_client()
+
         self._heartbeat_interval = 30.0  # reset until Hello
+
+        # Hard deadline for the entire reconnect handshake.  If the
+        # network is still down after sleep/wake, we don't want a
+        # single attempt to block the loop for tens of minutes.
         try:
-            await self._ensure_token()
-            gateway_url = await self._get_gateway_url()
-            await self._open_ws(gateway_url)
-            self._mark_connected()
-            logger.info("[%s] Reconnected", self._log_tag)
+            await asyncio.wait_for(
+                self._do_reconnect_handshake(),
+                timeout=RECONNECT_HANDSHAKE_TIMEOUT,
+            )
             return True
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[%s] Reconnect handshake timed out after %ds",
+                self._log_tag,
+                RECONNECT_HANDSHAKE_TIMEOUT,
+            )
+            return False
         except Exception as exc:
             logger.warning("[%s] Reconnect failed: %s", self._log_tag, exc)
             return False
+
+    async def _do_reconnect_handshake(self) -> None:
+        """Core reconnect: token → gateway URL → WebSocket open."""
+        await self._ensure_token()
+        gateway_url = await self._get_gateway_url()
+        await self._open_ws(gateway_url)
+        self._mark_connected()
+        logger.info("[%s] Reconnected", self._log_tag)
+
+    async def _refresh_http_client(self) -> None:
+        """Close and recreate the httpx client for fresh TCP connections.
+
+        Called before every reconnect attempt so that sleep/wake cycles
+        and proxy restarts don't leave us with a pool of dead sockets.
+        """
+        if self._http_client:
+            try:
+                await self._http_client.aclose()
+            except Exception:
+                pass
+        from gateway.platforms._http_client_limits import platform_httpx_limits
+        self._http_client = httpx.AsyncClient(
+            timeout=30.0,
+            follow_redirects=True,
+            event_hooks={"response": [_ssrf_redirect_guard]},
+            limits=platform_httpx_limits(),
+        )
 
     async def _read_events(self) -> None:
         """Read WebSocket frames until connection closes."""
